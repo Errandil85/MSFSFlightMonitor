@@ -1,0 +1,5 @@
+PySide6
+PySide6-WebEngine
+SimConnect
+requests
+PyQt6-WebEngine
