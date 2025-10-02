@@ -3,7 +3,7 @@ REM Create virtual environment named MSFSFlightMonitor
 python -m venv MSFSFlightMonitor
 
 REM Activate the virtual environment
-call MSFSFlightMonitor\Scripts\activate
+.\MSFSFlightMonitor\Scripts\Activate.ps1
 
 REM Upgrade pip
 python -m pip install --upgrade pip

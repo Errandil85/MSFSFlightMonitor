@@ -71,6 +71,9 @@ class MSFSFlightMonitor(QMainWindow):
         self.setup_modern_theme()
         self.create_ui()
         
+        # --- NEW: Auto-connect logic ---
+        QTimer.singleShot(500, self.auto_connect_and_monitor)
+        
     def setup_modern_theme(self):
         """Apply modern dark theme"""
         self.setStyleSheet("""
@@ -202,14 +205,11 @@ class MSFSFlightMonitor(QMainWindow):
         main_layout.setContentsMargins(10, 10, 10, 10)
         main_layout.setSpacing(10)
         
-        # Splitter
-        splitter = QSplitter(Qt.Horizontal)
+        # Horizontal Splitter (main)
+        splitter_h = QSplitter(Qt.Horizontal)
         
-        # Left side - Map and Profile
-        map_container = QWidget()
-        map_layout = QVBoxLayout(map_container)
-        map_layout.setContentsMargins(0, 0, 0, 0)
-        map_layout.setSpacing(5)
+        # --- NEW: Vertical Splitter for Map and Profile (Dynamic Sizing) ---
+        splitter_v = QSplitter(Qt.Vertical) 
         
         # Map view
         self.map_view = QWebEngineView()
@@ -217,18 +217,19 @@ class MSFSFlightMonitor(QMainWindow):
         settings.setAttribute(QWebEngineSettings.LocalContentCanAccessRemoteUrls, True)
         settings.setAttribute(QWebEngineSettings.JavascriptEnabled, True)
         self.map_view.loadFinished.connect(self.on_map_loaded)
-        
-        map_layout.addWidget(self.map_view, stretch=7)
+        splitter_v.addWidget(self.map_view)
         
         # Vertical Profile view
         self.profile_view = QWebEngineView()
         profile_settings = self.profile_view.settings()
         profile_settings.setAttribute(QWebEngineSettings.LocalContentCanAccessRemoteUrls, True)
         profile_settings.setAttribute(QWebEngineSettings.JavascriptEnabled, True)
+        splitter_v.addWidget(self.profile_view)
         
-        map_layout.addWidget(self.profile_view, stretch=3)
+        # Set initial sizes (e.g., 70% map, 30% profile). The user can drag to change this.
+        splitter_v.setSizes([700, 300]) 
         
-        splitter.addWidget(map_container)
+        splitter_h.addWidget(splitter_v)
         
         # Right side - Tabs
         tab_widget = QTabWidget()
@@ -245,10 +246,10 @@ class MSFSFlightMonitor(QMainWindow):
         history_tab = self.create_history_tab()
         tab_widget.addTab(history_tab, "📊 History")
         
-        splitter.addWidget(tab_widget)
-        splitter.setSizes([1100, 500])
+        splitter_h.addWidget(tab_widget)
+        splitter_h.setSizes([1100, 500])
         
-        main_layout.addWidget(splitter)
+        main_layout.addWidget(splitter_h)
         
         QTimer.singleShot(100, self.init_map)
         QTimer.singleShot(200, self.init_profile)
@@ -687,21 +688,33 @@ class MSFSFlightMonitor(QMainWindow):
                         distances.push(totalDist);
                     }
                     
-                    // Prepare data
-                    var labels = waypoints.map((wp, i) => wp.id);
-                    var altitudes = waypoints.map(wp => wp.altitude || 0);
+                    // Prepare data for scatter plot: {x: distance, y: altitude, id: waypoint_id}
+                    var flightPlanData = waypoints.map((wp, i) => ({
+                        x: distances[i], 
+                        y: wp.altitude || 0,
+                        id: wp.id // Store the ID for tooltips
+                    }));
                     
                     // Calculate 3-degree glide slope for last segment
                     var glideSlopeData = [];
                     if (waypoints.length >= 2) {
                         var lastIdx = waypoints.length - 1;
                         var destAlt = waypoints[lastIdx].altitude || 0;
+                        var destDist = distances[lastIdx];
                         
-                        // 3-degree glide slope: 300 ft per nm
+                        // Start the glide slope 15 nm out from the destination, or at the first waypoint if the route is shorter.
+                        var glideSlopeStartDist = Math.max(0, destDist - 15); 
+                        
+                        // Add points for the glide slope line
                         for (var i = 0; i < waypoints.length; i++) {
-                            var distToLast = distances[lastIdx] - distances[i];
-                            var glideSlopeAlt = destAlt + (distToLast * 300);
-                            glideSlopeData.push(glideSlopeAlt);
+                            var dist = distances[i];
+                            if (dist >= glideSlopeStartDist) {
+                                // Calculate altitude for a point on the 3-degree glideslope
+                                var distToDest = destDist - dist;
+                                // 3-degree glide slope: 300 ft per nm
+                                var glideSlopeAlt = destAlt + (distToDest * 300);
+                                glideSlopeData.push({ x: dist, y: glideSlopeAlt });
+                            }
                         }
                     }
                     
@@ -711,13 +724,15 @@ class MSFSFlightMonitor(QMainWindow):
                     
                     var datasets = [{
                         label: 'Flight Plan',
-                        data: altitudes,
+                        data: flightPlanData,
                         borderColor: '#89b4fa',
                         backgroundColor: 'rgba(137, 180, 250, 0.1)',
-                        fill: true,
-                        tension: 0.3,
+                        fill: false, // Set to false for a clean line profile
+                        showLine: true, // Crucial for connecting scatter points
+                        tension: 0, // Set tension to 0 for straight line segments
                         pointRadius: 6,
-                        pointBackgroundColor: '#89b4fa'
+                        pointBackgroundColor: '#89b4fa',
+                        pointHoverRadius: 8,
                     }];
                     
                     if (glideSlopeData.length > 0) {
@@ -727,35 +742,58 @@ class MSFSFlightMonitor(QMainWindow):
                             borderColor: '#f9e2af',
                             borderDash: [5, 5],
                             fill: false,
+                            showLine: true,
                             tension: 0,
                             pointRadius: 0
                         });
                     }
                     
                     chart = new Chart(ctx, {
-                        type: 'line',
+                        type: 'scatter', // Change to scatter for distance-based plotting
                         data: {
-                            labels: labels,
                             datasets: datasets
                         },
                         options: {
                             responsive: true,
                             maintainAspectRatio: false,
                             plugins: {
+                                tooltip: {
+                                    callbacks: {
+                                        title: function(context) {
+                                            if (context[0].dataset.label === 'Flight Plan') {
+                                                // Check if the data point has an an ID property
+                                                if (context[0].raw && context[0].raw.id) {
+                                                    return context[0].raw.id;
+                                                }
+                                            }
+                                            return context[0].dataset.label;
+                                        },
+                                        label: function(context) {
+                                            var label = context.dataset.label || '';
+                                            if (label) {
+                                                label += ': ';
+                                            }
+                                            label += 'Alt: ' + context.parsed.y.toFixed(0) + ' ft';
+                                            label += ' | Dist: ' + context.parsed.x.toFixed(1) + ' nm';
+                                            return label;
+                                        }
+                                    }
+                                },
                                 legend: {
                                     display: true,
                                     labels: { color: '#cdd6f4', font: { size: 12 } }
                                 },
                                 title: {
                                     display: true,
-                                    text: 'Vertical Profile',
+                                    text: 'Vertical Profile (Distance vs. Altitude)',
                                     color: '#cdd6f4',
                                     font: { size: 14, weight: 'bold' }
                                 }
                             },
                             scales: {
                                 x: {
-                                    title: { display: true, text: 'Waypoints', color: '#cdd6f4' },
+                                    type: 'linear', // Use linear scale for distance
+                                    title: { display: true, text: 'Distance (nm)', color: '#cdd6f4' },
                                     ticks: { color: '#cdd6f4' },
                                     grid: { color: '#45475a' }
                                 },
@@ -763,7 +801,7 @@ class MSFSFlightMonitor(QMainWindow):
                                     title: { display: true, text: 'Altitude (ft)', color: '#cdd6f4' },
                                     ticks: { color: '#cdd6f4' },
                                     grid: { color: '#45475a' },
-                                    beginAtZero: true
+                                    beginAtZero: false // Better for high-altitude flights
                                 }
                             }
                         }
@@ -824,7 +862,11 @@ class MSFSFlightMonitor(QMainWindow):
         self.show_vertical_profile = (state == Qt.Checked)
         if self.show_vertical_profile:
             self.profile_view.show()
+            # FIX: Wait for the QSplitter to resize the QWebEngineView, then update the data,
+            # and finally force the internal Chart.js graph to redraw (resize).
             QTimer.singleShot(100, self.update_profile)
+            # Increased delay to 500ms for more reliable Chart.js canvas redraw
+            QTimer.singleShot(500, lambda: self.profile_view.page().runJavaScript("if(chart) chart.resize();"))
         else:
             self.profile_view.hide()
         
@@ -958,35 +1000,67 @@ class MSFSFlightMonitor(QMainWindow):
             QTimer.singleShot(100, self.update_map)
             self.waypoint_list.setCurrentRow(self.selected_waypoint_idx)
             
-    def connect_simconnect(self):
+    # --- NEW: Helper for connection logic ---
+    def _attempt_simconnect_connection(self):
         try:
             self.sm = SimConnect()
             self.aq = AircraftRequests(self.sm)
             self.ae = AircraftEvents(self.sm)
-            
-            self.status_label.setText("Status: Connected ✅")
-            self.status_label.setStyleSheet("color: #a6e3a1; font-weight: bold; font-size: 11pt;")
-            self.btn_monitor.setEnabled(True)
-            self.btn_connect.setEnabled(False)
-            self.signals.log_signal.emit("✅ Connected to MSFS")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to connect to SimConnect: {str(e)}")
-            self.signals.log_signal.emit(f"❌ Connection failed: {str(e)}")
-            
-    def toggle_monitoring(self):
-        if not self.monitoring:
+            return True
+        except Exception:
+            return False
+
+    # --- NEW: Helper for monitoring logic ---
+    def _start_monitoring_core(self):
+        if self.sm is not None and not self.monitoring:
             self.monitoring = True
             self.btn_monitor.setText("Stop Monitoring")
-            self.signals.log_signal.emit("🚀 Started monitoring flight")
             self.map_view.page().runJavaScript("clearBreadcrumbs();")
             self.approach_path = []
             
             self.monitor_thread = threading.Thread(target=self.monitor_flight, daemon=True)
             self.monitor_thread.start()
+            return True
+        return False
+        
+    # --- UPDATED: Manual Connect Button Action ---
+    def connect_simconnect(self):
+        if self._attempt_simconnect_connection():
+            self.status_label.setText("Status: Connected ✅")
+            self.status_label.setStyleSheet("color: #a6e3a1; font-weight: bold; font-size: 11pt;")
+            self.btn_monitor.setEnabled(True)
+            self.btn_connect.setEnabled(False)
+            self.signals.log_signal.emit("✅ Connected to MSFS")
+        else:
+            QMessageBox.critical(self, "Error", "Failed to connect to SimConnect. Ensure MSFS is running.")
+            self.signals.log_signal.emit("❌ Connection failed. MSFS not running?")
+            
+    # --- UPDATED: Manual Monitor Button Action ---
+    def toggle_monitoring(self):
+        if not self.monitoring:
+            if self._start_monitoring_core():
+                self.signals.log_signal.emit("🚀 Started monitoring flight")
         else:
             self.monitoring = False
             self.btn_monitor.setText("Start Monitoring")
             self.signals.log_signal.emit("⏹️ Stopped monitoring")
+            
+    # --- NEW: Auto Connect and Monitor Logic ---
+    def auto_connect_and_monitor(self):
+        if self._attempt_simconnect_connection():
+            self.status_label.setText("Status: Connected ✅ (Auto)")
+            self.status_label.setStyleSheet("color: #a6e3a1; font-weight: bold; font-size: 11pt;")
+            self.btn_monitor.setEnabled(True)
+            self.btn_connect.setEnabled(False)
+            self.signals.log_signal.emit("✅ Auto-Connected to MSFS")
+            
+            # Auto-start monitoring
+            if self._start_monitoring_core():
+                self.signals.log_signal.emit("🚀 Started auto-monitoring flight")
+        else:
+            self.signals.log_signal.emit("❌ Auto-Connection failed. Click 'Connect to MSFS' to retry.")
+            self.status_label.setText("Status: Disconnected")
+            self.status_label.setStyleSheet("color: #f38ba8; font-weight: bold; font-size: 11pt;")
             
     def monitor_flight(self):
         was_airborne = False
@@ -1275,7 +1349,7 @@ class MSFSFlightMonitor(QMainWindow):
                 with open(filename, 'w') as f:
                     f.write("Date/Time,FPM,G-Force,Rating,Latitude,Longitude,Airport\n")
                     for entry in self.landing_history:
-                        f.write(f"{entry['timestamp']},{entry['fpm']:.0f},{entry['g_force']:.2f},"
+                        f.write(f"{entry['timestamp']},{entry['fpm']:.0f},{entry['g_force']:.2f},"\
                                f"{entry['rating']},{entry['lat']:.6f},{entry['lon']:.6f},{entry['airport']}\n")
                 self.signals.log_signal.emit(f"💾 Exported history to {filename}")
                 QMessageBox.information(self, "Success", "Landing history exported successfully")
