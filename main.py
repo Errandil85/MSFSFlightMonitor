@@ -12,7 +12,8 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                QHBoxLayout, QLabel, QPushButton, QListWidget, 
                                QCheckBox, QLineEdit, QTextEdit, QFileDialog,
                                QMessageBox, QSplitter, QGroupBox, QListWidgetItem,
-                               QTableWidget, QTableWidgetItem, QHeaderView, QTabWidget)
+                               QTableWidget, QTableWidgetItem, QHeaderView, QTabWidget,
+                               QSpinBox)
 from PySide6.QtCore import Qt, QUrl, Signal, QObject, QTimer, Slot, QSettings
 from PySide6.QtGui import QFont, QPalette, QColor
 from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -25,6 +26,7 @@ class UpdateSignals(QObject):
     waypoint_signal = Signal()
     position_signal = Signal(float, float, float, float)  # lat, lon, heading, altitude
     approach_signal = Signal(float, float, float)  # lat, lon, altitude for glide path
+    altitude_update_signal = Signal(int, float)  # waypoint index, new altitude
 
 class MSFSFlightMonitor(QMainWindow):
     def __init__(self):
@@ -55,6 +57,7 @@ class MSFSFlightMonitor(QMainWindow):
         }
         self.map_loaded = False
         self.last_altitude = 0
+        self.show_vertical_profile = True
         
         # Signals
         self.signals = UpdateSignals()
@@ -63,6 +66,7 @@ class MSFSFlightMonitor(QMainWindow):
         self.signals.waypoint_signal.connect(self.update_waypoint_list)
         self.signals.position_signal.connect(self.update_aircraft_position)
         self.signals.approach_signal.connect(self.add_approach_point)
+        self.signals.altitude_update_signal.connect(self.update_waypoint_altitude)
         
         self.setup_modern_theme()
         self.create_ui()
@@ -112,15 +116,23 @@ class MSFSFlightMonitor(QMainWindow):
                 background-color: #45475a;
                 color: #6c7086;
             }
-            QLineEdit {
+            QLineEdit, QSpinBox {
                 background-color: #313244;
                 border: 2px solid #45475a;
                 border-radius: 6px;
                 padding: 6px;
                 color: #cdd6f4;
             }
-            QLineEdit:focus {
+            QLineEdit:focus, QSpinBox:focus {
                 border: 2px solid #89b4fa;
+            }
+            QSpinBox::up-button, QSpinBox::down-button {
+                background-color: #45475a;
+                border: none;
+                width: 20px;
+            }
+            QSpinBox::up-button:hover, QSpinBox::down-button:hover {
+                background-color: #89b4fa;
             }
             QListWidget, QTableWidget {
                 background-color: #313244;
@@ -193,18 +205,29 @@ class MSFSFlightMonitor(QMainWindow):
         # Splitter
         splitter = QSplitter(Qt.Horizontal)
         
-        # Left side - Map
+        # Left side - Map and Profile
         map_container = QWidget()
         map_layout = QVBoxLayout(map_container)
         map_layout.setContentsMargins(0, 0, 0, 0)
+        map_layout.setSpacing(5)
         
+        # Map view
         self.map_view = QWebEngineView()
         settings = self.map_view.settings()
         settings.setAttribute(QWebEngineSettings.LocalContentCanAccessRemoteUrls, True)
         settings.setAttribute(QWebEngineSettings.JavascriptEnabled, True)
         self.map_view.loadFinished.connect(self.on_map_loaded)
         
-        map_layout.addWidget(self.map_view)
+        map_layout.addWidget(self.map_view, stretch=7)
+        
+        # Vertical Profile view
+        self.profile_view = QWebEngineView()
+        profile_settings = self.profile_view.settings()
+        profile_settings.setAttribute(QWebEngineSettings.LocalContentCanAccessRemoteUrls, True)
+        profile_settings.setAttribute(QWebEngineSettings.JavascriptEnabled, True)
+        
+        map_layout.addWidget(self.profile_view, stretch=3)
+        
         splitter.addWidget(map_container)
         
         # Right side - Tabs
@@ -228,6 +251,7 @@ class MSFSFlightMonitor(QMainWindow):
         main_layout.addWidget(splitter)
         
         QTimer.singleShot(100, self.init_map)
+        QTimer.singleShot(200, self.init_profile)
         
     def create_flight_plan_tab(self):
         tab = QWidget()
@@ -270,12 +294,36 @@ class MSFSFlightMonitor(QMainWindow):
         self.wp_info_label.setWordWrap(True)
         waypoint_layout.addWidget(self.wp_info_label)
         
+        # Altitude editor
+        alt_layout = QHBoxLayout()
+        alt_layout.addWidget(QLabel("Altitude (ft):"))
+        self.altitude_spinbox = QSpinBox()
+        self.altitude_spinbox.setRange(0, 50000)
+        self.altitude_spinbox.setSingleStep(100)
+        self.altitude_spinbox.setValue(0)
+        self.altitude_spinbox.setEnabled(False)
+        self.altitude_spinbox.valueChanged.connect(self.on_altitude_changed)
+        alt_layout.addWidget(self.altitude_spinbox)
+        waypoint_layout.addLayout(alt_layout)
+        
         self.pause_checkbox = QCheckBox("⏸️ Pause sim at this waypoint")
         self.pause_checkbox.stateChanged.connect(self.toggle_pause_waypoint)
         waypoint_layout.addWidget(self.pause_checkbox)
         
         waypoint_group.setLayout(waypoint_layout)
         layout.addWidget(waypoint_group)
+        
+        # Profile options
+        profile_group = QGroupBox("📊 Vertical Profile")
+        profile_layout = QVBoxLayout()
+        
+        self.show_profile_checkbox = QCheckBox("Show Vertical Profile")
+        self.show_profile_checkbox.setChecked(True)
+        self.show_profile_checkbox.stateChanged.connect(self.toggle_profile_visibility)
+        profile_layout.addWidget(self.show_profile_checkbox)
+        
+        profile_group.setLayout(profile_layout)
+        layout.addWidget(profile_group)
         
         # SimConnect section
         simconnect_group = QGroupBox("🔗 SimConnect")
@@ -439,6 +487,16 @@ class MSFSFlightMonitor(QMainWindow):
                 body { margin: 0; padding: 0; overflow: hidden; }
                 #map { width: 100vw; height: 100vh; background: #1e1e2e; }
                 .aircraft-icon { font-size: 28px; text-align: center; line-height: 30px; }
+                .waypoint-label {
+                    background: rgba(137, 180, 250, 0.9);
+                    border: none;
+                    border-radius: 4px;
+                    padding: 4px 8px;
+                    font-weight: bold;
+                    color: #1e1e2e;
+                    font-size: 12px;
+                    box-shadow: 0 2px 4px rgba(0,0,0,0.3);
+                }
             </style>
         </head>
         <body>
@@ -455,10 +513,13 @@ class MSFSFlightMonitor(QMainWindow):
                 var breadcrumbLine = null, breadcrumbs = [];
                 var landingMarkers = [], approachLine = null, approachPoints = [];
                 var touchdownMarker = null;
+                var waypointLabels = [];
                 
                 function updateRoute(waypoints) {
                     markers.forEach(m => map.removeLayer(m));
+                    waypointLabels.forEach(l => map.removeLayer(l));
                     markers = [];
+                    waypointLabels = [];
                     if (routeLine) map.removeLayer(routeLine);
                     if (waypoints.length === 0) return;
                     
@@ -469,9 +530,26 @@ class MSFSFlightMonitor(QMainWindow):
                             radius: 8, fillColor: color, color: '#fff',
                             weight: 2, opacity: 1, fillOpacity: 0.8
                         }).addTo(map);
-                        marker.bindPopup('<b>' + (idx + 1) + '. ' + wp.id + '</b><br>Lat: ' + 
-                                       wp.lat.toFixed(6) + '<br>Lon: ' + wp.lon.toFixed(6));
+                        
+                        var popupText = '<b>' + (idx + 1) + '. ' + wp.id + '</b><br>Lat: ' + 
+                                       wp.lat.toFixed(6) + '<br>Lon: ' + wp.lon.toFixed(6);
+                        if (wp.altitude) {
+                            popupText += '<br>Alt: ' + wp.altitude.toFixed(0) + ' ft';
+                        }
+                        marker.bindPopup(popupText);
+                        
+                        // Add label
+                        var label = L.marker([wp.lat, wp.lon], {
+                            icon: L.divIcon({
+                                className: 'waypoint-label',
+                                html: wp.id,
+                                iconSize: null
+                            }),
+                            zIndexOffset: 100
+                        }).addTo(map);
+                        
                         markers.push(marker);
+                        waypointLabels.push(label);
                         coords.push([wp.lat, wp.lon]);
                     });
                     
@@ -567,6 +645,158 @@ class MSFSFlightMonitor(QMainWindow):
         self.map_view.setUrl(QUrl.fromLocalFile(self.map_file))
         self.add_log("Initializing map...")
         
+    def init_profile(self):
+        """Initialize vertical profile view"""
+        html = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="utf-8">
+            <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
+            <style>
+                body { 
+                    margin: 0; 
+                    padding: 10px; 
+                    background: #1e1e2e; 
+                    overflow: hidden;
+                }
+                #container { 
+                    width: 100%; 
+                    height: calc(100vh - 20px);
+                }
+            </style>
+        </head>
+        <body>
+            <canvas id="profileChart"></canvas>
+            <script>
+                var chart = null;
+                var currentPosition = null;
+                
+                function updateProfile(waypoints) {
+                    if (waypoints.length === 0) return;
+                    
+                    // Calculate cumulative distance
+                    var distances = [0];
+                    var totalDist = 0;
+                    for (var i = 1; i < waypoints.length; i++) {
+                        var dist = calculateDistance(
+                            waypoints[i-1].lat, waypoints[i-1].lon,
+                            waypoints[i].lat, waypoints[i].lon
+                        );
+                        totalDist += dist;
+                        distances.push(totalDist);
+                    }
+                    
+                    // Prepare data
+                    var labels = waypoints.map((wp, i) => wp.id);
+                    var altitudes = waypoints.map(wp => wp.altitude || 0);
+                    
+                    // Calculate 3-degree glide slope for last segment
+                    var glideSlopeData = [];
+                    if (waypoints.length >= 2) {
+                        var lastIdx = waypoints.length - 1;
+                        var destAlt = waypoints[lastIdx].altitude || 0;
+                        
+                        // 3-degree glide slope: 300 ft per nm
+                        for (var i = 0; i < waypoints.length; i++) {
+                            var distToLast = distances[lastIdx] - distances[i];
+                            var glideSlopeAlt = destAlt + (distToLast * 300);
+                            glideSlopeData.push(glideSlopeAlt);
+                        }
+                    }
+                    
+                    var ctx = document.getElementById('profileChart').getContext('2d');
+                    
+                    if (chart) chart.destroy();
+                    
+                    var datasets = [{
+                        label: 'Flight Plan',
+                        data: altitudes,
+                        borderColor: '#89b4fa',
+                        backgroundColor: 'rgba(137, 180, 250, 0.1)',
+                        fill: true,
+                        tension: 0.3,
+                        pointRadius: 6,
+                        pointBackgroundColor: '#89b4fa'
+                    }];
+                    
+                    if (glideSlopeData.length > 0) {
+                        datasets.push({
+                            label: '3° Glide Slope',
+                            data: glideSlopeData,
+                            borderColor: '#f9e2af',
+                            borderDash: [5, 5],
+                            fill: false,
+                            tension: 0,
+                            pointRadius: 0
+                        });
+                    }
+                    
+                    chart = new Chart(ctx, {
+                        type: 'line',
+                        data: {
+                            labels: labels,
+                            datasets: datasets
+                        },
+                        options: {
+                            responsive: true,
+                            maintainAspectRatio: false,
+                            plugins: {
+                                legend: {
+                                    display: true,
+                                    labels: { color: '#cdd6f4', font: { size: 12 } }
+                                },
+                                title: {
+                                    display: true,
+                                    text: 'Vertical Profile',
+                                    color: '#cdd6f4',
+                                    font: { size: 14, weight: 'bold' }
+                                }
+                            },
+                            scales: {
+                                x: {
+                                    title: { display: true, text: 'Waypoints', color: '#cdd6f4' },
+                                    ticks: { color: '#cdd6f4' },
+                                    grid: { color: '#45475a' }
+                                },
+                                y: {
+                                    title: { display: true, text: 'Altitude (ft)', color: '#cdd6f4' },
+                                    ticks: { color: '#cdd6f4' },
+                                    grid: { color: '#45475a' },
+                                    beginAtZero: true
+                                }
+                            }
+                        }
+                    });
+                }
+                
+                function updateAircraftOnProfile(waypointIndex, altitude) {
+                    if (!chart) return;
+                    currentPosition = { index: waypointIndex, altitude: altitude };
+                    // This could be enhanced to show aircraft position on the chart
+                }
+                
+                function calculateDistance(lat1, lon1, lat2, lon2) {
+                    var R = 3440.065; // nautical miles
+                    var dLat = (lat2 - lat1) * Math.PI / 180;
+                    var dLon = (lon2 - lon1) * Math.PI / 180;
+                    var a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+                            Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+                            Math.sin(dLon/2) * Math.sin(dLon/2);
+                    var c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+                    return R * c;
+                }
+            </script>
+        </body>
+        </html>
+        """
+        
+        self.profile_file = os.path.join(tempfile.gettempdir(), 'msfs_profile.html')
+        with open(self.profile_file, 'w', encoding='utf-8') as f:
+            f.write(html)
+        
+        self.profile_view.setUrl(QUrl.fromLocalFile(self.profile_file))
+        
     @Slot(bool)
     def on_map_loaded(self, success):
         if success:
@@ -584,6 +814,20 @@ class MSFSFlightMonitor(QMainWindow):
         waypoints_json = json.dumps(self.waypoints)
         self.map_view.page().runJavaScript(f"updateRoute({waypoints_json});")
         
+    def update_profile(self):
+        if not self.waypoints:
+            return
+        waypoints_json = json.dumps(self.waypoints)
+        self.profile_view.page().runJavaScript(f"updateProfile({waypoints_json});")
+        
+    def toggle_profile_visibility(self, state):
+        self.show_vertical_profile = (state == Qt.Checked)
+        if self.show_vertical_profile:
+            self.profile_view.show()
+            QTimer.singleShot(100, self.update_profile)
+        else:
+            self.profile_view.hide()
+        
     @Slot(str)
     def add_log(self, message):
         timestamp = time.strftime('%H:%M:%S')
@@ -600,15 +844,27 @@ class MSFSFlightMonitor(QMainWindow):
                 for atp in root.findall('.//ATCWaypoint'):
                     wp_id = atp.get('id')
                     world_pos = atp.find('.//WorldPosition').text.split(',')
+                    
+                    # Try to get altitude from PLN
+                    altitude = 0
+                    alt_elem = atp.find('.//ATCAltitude')
+                    if alt_elem is not None and alt_elem.text:
+                        try:
+                            altitude = float(alt_elem.text)
+                        except:
+                            altitude = 0
+                    
                     self.waypoints.append({
                         'id': wp_id,
                         'lat': float(world_pos[0]),
                         'lon': float(world_pos[1]),
+                        'altitude': altitude,
                         'pause': False
                     })
                 
                 self.update_waypoint_list()
                 QTimer.singleShot(100, self.update_map)
+                QTimer.singleShot(200, self.update_profile)
                 self.signals.log_signal.emit(f"✅ Loaded {len(self.waypoints)} waypoints from PLN")
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to load PLN: {str(e)}")
@@ -630,15 +886,23 @@ class MSFSFlightMonitor(QMainWindow):
             if 'fetch' in data and data['fetch']['status'] == 'Success':
                 self.waypoints = []
                 for fix in data.get('navlog', {}).get('fix', []):
+                    altitude = 0
+                    try:
+                        altitude = float(fix.get('altitude_feet', 0))
+                    except:
+                        altitude = 0
+                        
                     self.waypoints.append({
                         'id': fix.get('ident', 'Unknown'),
                         'lat': float(fix.get('pos_lat', 0)),
                         'lon': float(fix.get('pos_long', 0)),
+                        'altitude': altitude,
                         'pause': False
                     })
                 
                 self.update_waypoint_list()
                 QTimer.singleShot(100, self.update_map)
+                QTimer.singleShot(200, self.update_profile)
                 self.signals.log_signal.emit(f"✅ Loaded {len(self.waypoints)} waypoints from SimBrief")
             else:
                 QMessageBox.critical(self, "Error", "Failed to fetch SimBrief plan")
@@ -649,21 +913,43 @@ class MSFSFlightMonitor(QMainWindow):
         self.waypoint_list.clear()
         for i, wp in enumerate(self.waypoints):
             pause = " ⏸️" if wp['pause'] else ""
-            self.waypoint_list.addItem(f"{i+1}. {wp['id']}{pause}")
+            alt_str = f" ({wp.get('altitude', 0):.0f} ft)" if wp.get('altitude', 0) > 0 else ""
+            self.waypoint_list.addItem(f"{i+1}. {wp['id']}{alt_str}{pause}")
             
     def on_waypoint_select(self, row):
         if 0 <= row < len(self.waypoints):
             self.selected_waypoint_idx = row
             wp = self.waypoints[row]
-            self.wp_info_label.setText(f"<b>{wp['id']}</b><br>Coordinates: {wp['lat']:.6f}, {wp['lon']:.6f}")
+            alt_str = f"<br>Altitude: {wp.get('altitude', 0):.0f} ft" if wp.get('altitude', 0) > 0 else ""
+            self.wp_info_label.setText(f"<b>{wp['id']}</b><br>Coordinates: {wp['lat']:.6f}, {wp['lon']:.6f}{alt_str}")
+            
             self.pause_checkbox.blockSignals(True)
             self.pause_checkbox.setChecked(wp['pause'])
             self.pause_checkbox.blockSignals(False)
             self.pause_checkbox.setEnabled(True)
+            
+            self.altitude_spinbox.blockSignals(True)
+            self.altitude_spinbox.setValue(int(wp.get('altitude', 0)))
+            self.altitude_spinbox.blockSignals(False)
+            self.altitude_spinbox.setEnabled(True)
         else:
             self.selected_waypoint_idx = None
             self.wp_info_label.setText("Select a waypoint")
             self.pause_checkbox.setEnabled(False)
+            self.altitude_spinbox.setEnabled(False)
+            
+    def on_altitude_changed(self, value):
+        if self.selected_waypoint_idx is not None:
+            self.waypoints[self.selected_waypoint_idx]['altitude'] = value
+            self.update_waypoint_list()
+            QTimer.singleShot(100, self.update_map)
+            QTimer.singleShot(200, self.update_profile)
+            self.waypoint_list.setCurrentRow(self.selected_waypoint_idx)
+            
+    @Slot(int, float)
+    def update_waypoint_altitude(self, idx, altitude):
+        if 0 <= idx < len(self.waypoints):
+            self.waypoints[idx]['altitude'] = altitude
             
     def toggle_pause_waypoint(self, state):
         if self.selected_waypoint_idx is not None:
@@ -808,14 +1094,51 @@ class MSFSFlightMonitor(QMainWindow):
         return R * c
         
     def get_landing_rating(self, fpm, g_force):
+        """
+        Improved landing rating based on both FPM and G-force
+        Weighting: 60% FPM, 40% G-force
+        """
         abs_fpm = abs(fpm)
-        if abs_fpm < 100 and g_force < 1.5:
+        
+        # FPM scoring (0-100)
+        if abs_fpm < 100:
+            fpm_score = 100
+        elif abs_fpm < 200:
+            fpm_score = 85
+        elif abs_fpm < 300:
+            fpm_score = 70
+        elif abs_fpm < 400:
+            fpm_score = 50
+        elif abs_fpm < 600:
+            fpm_score = 30
+        else:
+            fpm_score = 10
+            
+        # G-force scoring (0-100)
+        if g_force < 1.3:
+            g_score = 100
+        elif g_force < 1.5:
+            g_score = 85
+        elif g_force < 1.8:
+            g_score = 70
+        elif g_force < 2.0:
+            g_score = 50
+        elif g_force < 2.5:
+            g_score = 30
+        else:
+            g_score = 10
+            
+        # Combined score (weighted)
+        combined_score = (fpm_score * 0.6) + (g_score * 0.4)
+        
+        # Determine rating
+        if combined_score >= 95:
             return "⭐⭐⭐⭐⭐", "PERFECT - Butter Landing!", "#a6e3a1"
-        elif abs_fpm < 200 and g_force < 1.8:
+        elif combined_score >= 80:
             return "⭐⭐⭐⭐", "Excellent Landing", "#a6e3a1"
-        elif abs_fpm < 300 and g_force < 2.0:
+        elif combined_score >= 65:
             return "⭐⭐⭐", "Good Landing", "#f9e2af"
-        elif abs_fpm < 500 and g_force < 2.5:
+        elif combined_score >= 45:
             return "⭐⭐", "Acceptable Landing", "#fab387"
         else:
             return "⭐", "Hard Landing - Check Aircraft!", "#f38ba8"
